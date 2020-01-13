@@ -1,4 +1,11 @@
 import re
+from base64 import b64encode, b64decode
+from hashlib import sha256, sha1
+from hmac import HMAC
+from socket import create_connection
+from ssl import create_default_context
+from time import time, strptime
+from urllib import parse
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -17,6 +24,11 @@ from esphome.core import coroutine_with_priority, coroutine, CORE
 DEPENDENCIES = ['network']
 AUTO_LOAD = ['json', 'async_tcp']
 
+CONF_AZURE_IOT_HUB_DEVICE_ID = 'device_id'
+CONF_AZURE_IOT_HUB_DEVICE_KEY = 'device_key'
+CONF_AZURE_IOT_HUB_NAME = 'hub_name'
+CONF_AZURE_IOT_HUB = 'azure_iot_hub'
+
 
 def validate_message_just_topic(value):
     value = cv.publish_topic(value)
@@ -34,6 +46,12 @@ MQTT_MESSAGE_TEMPLATE_SCHEMA = cv.Any(None, MQTT_MESSAGE_BASE, validate_message_
 MQTT_MESSAGE_SCHEMA = cv.Any(None, MQTT_MESSAGE_BASE.extend({
     cv.Required(CONF_PAYLOAD): cv.mqtt_payload,
 }))
+
+MQTT_AZURE_IOT_HUB_SCHEMA = cv.Schema({
+    cv.Required(CONF_AZURE_IOT_HUB_DEVICE_ID): cv.string,
+    cv.Required(CONF_AZURE_IOT_HUB_DEVICE_KEY): cv.string,
+    cv.Optional(CONF_AZURE_IOT_HUB_NAME): cv.string_strict
+})
 
 mqtt_ns = cg.esphome_ns.namespace('mqtt')
 MQTTMessage = mqtt_ns.struct('MQTTMessage')
@@ -57,6 +75,36 @@ MQTTSensorComponent = mqtt_ns.class_('MQTTSensorComponent', MQTTComponent)
 MQTTSwitchComponent = mqtt_ns.class_('MQTTSwitchComponent', MQTTComponent)
 MQTTTextSensor = mqtt_ns.class_('MQTTTextSensor', MQTTComponent)
 
+# from https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-devguide-security
+def generate_iot_hub_sas_token(uri, key, expiry_seconds):
+    ttl = time() + expiry_seconds
+    sign_key = "%s\n%d" % ((parse.quote_plus(uri)), int(ttl))
+    signature = b64encode(HMAC(b64decode(key), sign_key.encode('utf-8'), sha256).digest())
+
+    raw_token = {
+        'sr': uri,
+        'sig': signature,
+        'se': str(int(ttl))
+    }
+
+    return 'SharedAccessSignature ' + parse.urlencode(raw_token)
+
+
+# based on example from https://www.solrac.nl/retrieve-thumbprint-ssltls-python/
+def retrieve_ssl_certificate_fingerprint_and_expiration(host_name, port):
+    context = create_default_context()
+    with create_connection((host_name, port)) as sock:
+        sock.settimeout(1)
+        with context.wrap_socket(sock, server_hostname=host_name) as wrappedSocket:
+            # pylint: disable=no-member
+            ssl_date_fmt = r'%b %d %H:%M:%S %Y %Z'
+            der_cert_bin = wrappedSocket.getpeercert(True)
+            expiration = strptime(wrappedSocket.getpeercert()['notAfter'], ssl_date_fmt)
+
+            # Thumbprint
+            thumb_sha1 = sha1(der_cert_bin).hexdigest()
+
+            return expiration, thumb_sha1
 
 def validate_config(value):
     # Populate default fields
@@ -89,6 +137,17 @@ def validate_config(value):
             CONF_QOS: 0,
             CONF_RETAIN: True,
         }
+    if CONF_AZURE_IOT_HUB in value:
+        iot_conf = value[CONF_AZURE_IOT_HUB]
+        out[CONF_CLIENT_ID] = f'{iot_conf[CONF_AZURE_IOT_HUB_DEVICE_ID]}'
+        hub_address = value[CONF_BROKER] if CONF_AZURE_IOT_HUB_NAME not in iot_conf else f'{iot_conf[CONF_AZURE_IOT_HUB_NAME]}.azure-devices.net'
+        out[CONF_USERNAME] = f'{hub_address}/{iot_conf[CONF_AZURE_IOT_HUB_DEVICE_ID]}/?api-version=2018-06-30'
+        out[CONF_PASSWORD] = generate_iot_hub_sas_token(f'{hub_address}/devices/{iot_conf[CONF_AZURE_IOT_HUB_DEVICE_ID]}', iot_conf[CONF_AZURE_IOT_HUB_DEVICE_KEY], 100 * 365 * 24 * 60 * 60)
+        out[CONF_DISCOVERY] = False
+        out[CONF_TOPIC_PREFIX] = f'devices/{iot_conf[CONF_AZURE_IOT_HUB_DEVICE_ID]}/messages/events/'
+        out[CONF_PORT] = 8883
+        expiration, fingerprint = retrieve_ssl_certificate_fingerprint_and_expiration(hub_address, 443)
+        out[CONF_SSL_FINGERPRINTS] = [ fingerprint ]
     return out
 
 
@@ -117,6 +176,8 @@ CONFIG_SCHEMA = cv.All(cv.Schema({
     cv.Optional(CONF_LOG_TOPIC): cv.Any(None, MQTT_MESSAGE_BASE.extend({
         cv.Optional(CONF_LEVEL): logger.is_log_level,
     }), validate_message_just_topic),
+
+    cv.Optional(CONF_AZURE_IOT_HUB): MQTT_AZURE_IOT_HUB_SCHEMA,
 
     cv.Optional(CONF_SSL_FINGERPRINTS): cv.All(cv.only_on_esp8266,
                                                cv.ensure_list(validate_fingerprint)),
